@@ -22,25 +22,10 @@ log-error.txt
 dump_header.py
 output/
 
-# Local reference code copies
+# Local reference code snapshots (not part of main branch)
 HavokMax-master/
+havokmax-blender-master/
 3rd_party/*
 !3rd_party/HavokLib
 !3rd_party/HavokLib/**
-src/
-
-# Root-level upstream metadata copies kept locally
-/.gitattributes
-/.github/
-/CHANGELOG
-/CMakeLists.txt
-/LICENSE
-/README.md
-/manifest.toml
-
-# Extra plugin files kept local-only in this workspace
-/havok_blender/io/__init__.py
-/havok_blender/io/igz_port/
-/havok_blender/operators/__init__.py
-/havok_blender/operators/preferences.py
 
