@@ -448,7 +448,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         armature = bpy.data.armatures.new(skel.name)
         armature_obj = bpy.data.objects.new(skel.name, armature)
         try:
-            armature.display_type = "STICK"
+            armature.display_type = "OCTAHEDRAL"
         except Exception:
             pass
 
