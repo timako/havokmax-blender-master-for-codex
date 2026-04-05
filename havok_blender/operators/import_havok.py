@@ -350,7 +350,10 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             else self._get_selected_armature(context)
         )
 
-        if armature_obj is None and self.import_skeleton and pack.skeleton:
+        # If the source contains a skeleton and the user asked to import it,
+        # always create a new armature object from that skeleton definition.
+        # Existing scene armatures are only reused for animation-only files.
+        if self.import_skeleton and pack.skeleton:
             armature_obj = self._build_armature(context, pack, prefs.scale, axis_mat)
 
         if self.import_meshes and pack.meshes:
@@ -358,7 +361,10 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
         selected_animations = self._resolve_animations(pack)
         if self._should_import_animation(target_ext, selected_animations, armature_obj):
-            if armature_obj is None:
+            animation_target = self._select_animation_armature(
+                context, pack, armature_obj
+            )
+            if animation_target is None:
                 self.report(
                     {"WARNING"},
                     "Animation data found but no armature was available to bind tracks",
@@ -368,7 +374,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                     context,
                     pack,
                     selected_animations,
-                    armature_obj,
+                    animation_target,
                     prefs.scale * self.animation_scale,
                     axis_mat,
                 )
@@ -649,19 +655,27 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 }
                 name_to_havok_index[bone.name] = idx
         else:
+            def _to_float_seq(value, expected_len: int) -> Optional[List[float]]:
+                try:
+                    if value is None or len(value) != expected_len:
+                        return None
+                    return [float(value[i]) for i in range(expected_len)]
+                except Exception:
+                    return None
+
             for b in armature_bones:
                 idx_val = b.get("havok_index")
                 t = b.get("havok_rest_t")
                 r = b.get("havok_rest_r")
                 s = b.get("havok_rest_s")
+                t_vals = _to_float_seq(t, 3)
+                r_vals = _to_float_seq(r, 4)
+                s_vals = _to_float_seq(s, 3)
                 if (
                     isinstance(idx_val, (int, float))
-                    and isinstance(t, (list, tuple))
-                    and isinstance(r, (list, tuple))
-                    and isinstance(s, (list, tuple))
-                    and len(t) == 3
-                    and len(r) == 4
-                    and len(s) == 3
+                    and t_vals is not None
+                    and r_vals is not None
+                    and s_vals is not None
                 ):
                     idx = int(idx_val)
                     parent_idx = -1
@@ -673,17 +687,31 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                         "name": b.name,
                         "parent": parent_idx,
                         "rest_local": self._compose_transform(
-                            Vector((float(t[0]), float(t[1]), float(t[2]))),
+                            Vector((t_vals[0], t_vals[1], t_vals[2])),
                             mathutils.Quaternion(
-                                (float(r[0]), float(r[1]), float(r[2]), float(r[3]))
+                                (r_vals[0], r_vals[1], r_vals[2], r_vals[3])
                             ),
-                            Vector((float(s[0]), float(s[1]), float(s[2]))),
+                            Vector((s_vals[0], s_vals[1], s_vals[2])),
                         ),
                     }
                     name_to_havok_index[b.name] = idx
 
+        has_annotation_names = any(
+            bool(name)
+            for anim in animations
+            for name in getattr(anim, "annotation_tracks", [])
+        )
+
         # Last-resort fallback if this armature was not created by this importer.
+        # For animation-only files without annotation names, index-only mapping is
+        # ambiguous, so require importer tags (havok_index) instead.
         if not havok_nodes:
+            if not pack.skeleton and not has_annotation_names:
+                self.report(
+                    {"WARNING"},
+                    "Animation-only file has no skeleton names; import/apply it on a Havok-imported armature first",
+                )
+                return
             for idx, b in enumerate(armature_bones):
                 parent_idx = idx - 1
                 if b.parent and b.parent.name in name_to_havok_index:
@@ -759,26 +787,10 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             else:
                 global_fixes[idx] = identity
 
+        imported_actions = 0
+        skipped_unmatched = 0
+
         for animation in animations:
-            action = bpy.data.actions.new(animation.name)
-            armature_obj.animation_data_create()
-            armature_obj.animation_data.action = action
-
-            # Blender 5.0+ compatibility: Action.fcurves replaced by Layered Action API
-            fcurves_collection = None
-            if hasattr(action, "fcurves"):
-                fcurves_collection = action.fcurves
-            else:
-                # Create necessary hierarchy for Layered Action
-                slot = action.slots.new("OBJECT", "Slot")
-                layer = action.layers.new("Layer")
-                strip = layer.strips.new(type="KEYFRAME")
-                bag = strip.channelbags.new(slot)
-                fcurves_collection = bag.fcurves
-
-                # Assign the slot to the object's animation data
-                if hasattr(armature_obj.animation_data, "action_slot_handle"):
-                    armature_obj.animation_data.action_slot_handle = slot.handle
 
             # Resolve track -> Havok bone index map once.
             track_to_havok: Dict[int, int] = {}
@@ -814,6 +826,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 track_to_havok[track_idx] = bone_idx
 
             if not track_to_havok:
+                skipped_unmatched += 1
                 continue
 
             animated_indices = sorted(set(track_to_havok.values()))
@@ -822,6 +835,35 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 for idx in animated_indices
                 if str(havok_nodes[idx]["name"]) in armature_by_name
             ]
+
+            if not animated_names:
+                skipped_unmatched += 1
+                continue
+
+            frame_count = max((len(t) for t in animation.tracks if t), default=0)
+            if frame_count <= 0:
+                skipped_unmatched += 1
+                continue
+
+            action = bpy.data.actions.new(animation.name)
+            armature_obj.animation_data_create()
+            armature_obj.animation_data.action = action
+
+            # Blender 5.0+ compatibility: Action.fcurves replaced by Layered Action API
+            fcurves_collection = None
+            if hasattr(action, "fcurves"):
+                fcurves_collection = action.fcurves
+            else:
+                # Create necessary hierarchy for Layered Action
+                slot = action.slots.new("OBJECT", "Slot")
+                layer = action.layers.new("Layer")
+                strip = layer.strips.new(type="KEYFRAME")
+                bag = strip.channelbags.new(slot)
+                fcurves_collection = bag.fcurves
+
+                # Assign the slot to the object's animation data
+                if hasattr(armature_obj.animation_data, "action_slot_handle"):
+                    armature_obj.animation_data.action_slot_handle = slot.handle
 
             # Pre-create fcurves once per animated bone.
             bone_curves: Dict[str, tuple[list, list, list]] = {}
@@ -846,14 +888,18 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 ]
                 bone_curves[bone_name] = (fcurves_loc, fcurves_rot, fcurves_scale)
 
-            frame_count = max((len(t) for t in animation.tracks if t), default=0)
-            if frame_count <= 0:
+            if not bone_curves:
+                bpy.data.actions.remove(action)
+                skipped_unmatched += 1
                 continue
+
             frame_rate = (
                 (animation.duration / max(frame_count - 1, 1))
                 if animation.duration > 0
                 else 1.0
             )
+
+            inserted_keyframes = 0
 
             for frame_idx in range(frame_count):
                 # Start from rest for bones without keyed tracks.
@@ -950,17 +996,37 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                         curve.keyframe_points.insert(
                             frame, loc[axis], options={"FAST"}
                         ).interpolation = "LINEAR"
+                        inserted_keyframes += 1
                     for axis, curve in enumerate(fcurves_rot):
                         curve.keyframe_points.insert(
                             frame, rot[axis], options={"FAST"}
                         ).interpolation = "LINEAR"
+                        inserted_keyframes += 1
                     for axis, curve in enumerate(fcurves_scale):
                         curve.keyframe_points.insert(
                             frame, sca[axis], options={"FAST"}
                         ).interpolation = "LINEAR"
+                        inserted_keyframes += 1
 
-            # Keep last action applied
+            if inserted_keyframes <= 0:
+                bpy.data.actions.remove(action)
+                skipped_unmatched += 1
+                continue
+
+            # Keep last non-empty action applied
             armature_obj.animation_data.action = action
+            imported_actions += 1
+
+        if imported_actions == 0 and animations:
+            self.report(
+                {"WARNING"},
+                "No animation tracks matched the target armature; select/import the correct skeleton first",
+            )
+        elif skipped_unmatched > 0:
+            self.report(
+                {"INFO"},
+                f"Imported {imported_actions} action(s); skipped {skipped_unmatched} unmatched animation(s)",
+            )
 
     def _get_selected_armature(
         self, context: bpy.types.Context
@@ -972,6 +1038,68 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         if len(scene_armatures) == 1:
             return scene_armatures[0]
         return None
+
+    @staticmethod
+    def _count_havok_tagged_bones(armature_obj: Optional[bpy.types.Object]) -> int:
+        if armature_obj is None or armature_obj.type != "ARMATURE":
+            return 0
+        return sum(1 for b in armature_obj.data.bones if "havok_index" in b)
+
+    @staticmethod
+    def _count_skeleton_name_overlap(
+        armature_obj: Optional[bpy.types.Object], skeleton: Optional[parsers.HavokSkeleton]
+    ) -> int:
+        if (
+            armature_obj is None
+            or armature_obj.type != "ARMATURE"
+            or skeleton is None
+        ):
+            return 0
+        arm_names = {b.name for b in armature_obj.data.bones}
+        return sum(1 for bone in skeleton.bones if bone.name in arm_names)
+
+    def _select_animation_armature(
+        self,
+        context: bpy.types.Context,
+        pack: HavokPack,
+        preferred: Optional[bpy.types.Object],
+    ) -> Optional[bpy.types.Object]:
+        scene_armatures = [obj for obj in context.scene.objects if obj.type == "ARMATURE"]
+        if not scene_armatures:
+            return preferred
+
+        if pack.skeleton is not None:
+            def score(obj: bpy.types.Object) -> tuple[int, int, int]:
+                return (
+                    self._count_skeleton_name_overlap(obj, pack.skeleton),
+                    self._count_havok_tagged_bones(obj),
+                    len(obj.data.bones),
+                )
+        else:
+            def score(obj: bpy.types.Object) -> tuple[int, int]:
+                return (
+                    self._count_havok_tagged_bones(obj),
+                    len(obj.data.bones),
+                )
+
+        best = max(scene_armatures, key=score)
+        best_score = score(best)
+        pref_score = score(preferred) if preferred and preferred.type == "ARMATURE" else None
+
+        if pack.skeleton is not None:
+            # Prefer the armature with the strongest skeleton-name match.
+            if best_score[0] > 0:
+                if pref_score and pref_score[0] > 0 and pref_score >= best_score:
+                    return preferred
+                return best
+            return preferred
+
+        # Animation-only files: prefer importer-tagged armatures (havok_index).
+        if pref_score and pref_score[0] > 0:
+            return preferred
+        if best_score[0] > 0:
+            return best
+        return preferred
 
     def _should_import_animation(
         self,
