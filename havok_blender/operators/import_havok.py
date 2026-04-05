@@ -343,6 +343,8 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             to_forward=prefs.forward_axis,
             to_up=prefs.up_axis,
         ).to_4x4()
+        # Keep original axis mapping, but cancel the unintended mirror across YZ.
+        axis_mat = axis_mat @ Matrix.Scale(-1.0, 4, (1.0, 0.0, 0.0))
 
         armature_obj = (
             context.active_object
