@@ -202,24 +202,39 @@ class hkxHeader:
 
         # count (int32)
         section = self.get_section(section_index)
-        count = int.from_bytes(
+        raw_count = int.from_bytes(
             section.data[offset : offset + 4],
             "little" if self.layout.little_endian else "big",
         )
         offset += 4
 
         # capacityAndFlags (int32)
-        capacity = int.from_bytes(
+        raw_capacity = int.from_bytes(
             section.data[offset : offset + 4],
             "little" if self.layout.little_endian else "big",
         )
         offset += 4
 
-        # Handle potential swapped count/capacity (observed in some PS4 files)
-        if count == 0 and capacity > 0:
-            # Heuristic: if count is 0 but capacity is set, and capacity looks like a valid count/size
-            # (e.g. matches num_blocks or data size), assume swapped.
-            # For now, just swap if count is 0.
+        # hkArray capacity packs flags in high bits (0x40000000/0x80000000).
+        # Some titles also set the high bit in count for empty/null arrays.
+        count = raw_count & 0x7FFFFFFF
+        capacity = raw_capacity & 0x3FFFFFFF
+
+        # Null pointer arrays should not report giant counts from flag bits.
+        if data_ptr is None:
+            if count > 1_000_000:
+                count = 0
+            capacity = 0
+
+        # Conservative swapped count/capacity heuristic for rare variant layouts.
+        if (
+            data_ptr is not None
+            and count == 0
+            and capacity > 0
+            and capacity <= 1_000_000
+            and raw_count == 0
+            and (raw_capacity & 0x80000000) == 0
+        ):
             count, capacity = capacity, count
 
         # Handle masked pointer (observed 0x80000000 base)
@@ -230,6 +245,17 @@ class hkxHeader:
                 data_ptr = (sid, soff)
 
         return data_ptr, count, capacity
+
+    def get_virtual_class_name(self, section_index, object_offset):
+        section = self.get_section(section_index)
+        if not section:
+            return ""
+
+        for data_offset, class_sid, class_off in section.virtual_fixups:
+            if data_offset == object_offset:
+                return self.read_string_at(class_sid, class_off)
+
+        return ""
 
     def read_string_ptr(self, section_index, offset):
         ptr = self.read_pointer(section_index, offset)
@@ -424,33 +450,53 @@ class hkxHeader:
 
         # Skip hkReferencedObject
         header_size = 16 if ptr_size == 8 else 8
-        current_offset = offset + header_size
-
-        # Note: In some versions/platforms (like PS4/Havok 2014), m_type seems to be missing
-        # or the layout is different. We observe duration (float) as the first field.
+        base_offset = offset + header_size
+        current_offset = base_offset
 
         section = self.get_section(section_index)
+        class_name = self.get_virtual_class_name(section_index, offset)
 
-        # duration (float)
-        duration = struct.unpack(
-            "<f" if self.layout.little_endian else ">f",
-            section.data[current_offset : current_offset + 4],
-        )[0]
-        current_offset += 4
+        def read_i32(off):
+            return int.from_bytes(
+                section.data[off : off + 4],
+                "little" if self.layout.little_endian else "big",
+                signed=True,
+            )
 
-        # numberOfTransformTracks (int32)
-        num_transform_tracks = int.from_bytes(
-            section.data[current_offset : current_offset + 4],
-            "little" if self.layout.little_endian else "big",
-        )
-        current_offset += 4
+        def read_f32(off):
+            return struct.unpack(
+                "<f" if self.layout.little_endian else ">f",
+                section.data[off : off + 4],
+            )[0]
 
-        # numberOfFloatTracks (int32)
-        num_float_tracks = int.from_bytes(
-            section.data[current_offset : current_offset + 4],
-            "little" if self.layout.little_endian else "big",
-        )
-        current_offset += 4
+        # Some layouts include hkaAnimation::m_type before duration.
+        # Others start directly with duration.
+        MAX_TRACKS = 4096
+
+        def header_plausible(dur, trk, ftrk):
+            return 0.0 <= dur <= 36000.0 and 0 <= trk <= MAX_TRACKS and 0 <= ftrk <= MAX_TRACKS
+
+        duration = read_f32(current_offset)
+        num_transform_tracks = read_i32(current_offset + 4)
+        num_float_tracks = read_i32(current_offset + 8)
+        current_offset += 12
+
+        # Prefer the "m_type + duration" layout for known derived animation classes.
+        if class_name in {
+            "hkaSplineCompressedAnimation",
+            "hkaInterleavedUncompressedAnimation",
+            "hkaDeltaCompressedAnimation",
+            "hkaWaveletCompressedAnimation",
+            "hkaPredictiveCompressedAnimation",
+        } or not header_plausible(duration, num_transform_tracks, num_float_tracks):
+            shifted_duration = read_f32(base_offset + 4)
+            shifted_tracks = read_i32(base_offset + 8)
+            shifted_float_tracks = read_i32(base_offset + 12)
+            if header_plausible(shifted_duration, shifted_tracks, shifted_float_tracks):
+                duration = shifted_duration
+                num_transform_tracks = shifted_tracks
+                num_float_tracks = shifted_float_tracks
+                current_offset = base_offset + 16
 
         # extractedMotion (ptr)
         extracted_motion_ptr = self.read_pointer(section_index, current_offset)
@@ -466,7 +512,6 @@ class hkxHeader:
         num_frames = 0
 
         # Sanity-check track counts to prevent multi-billion-loop freezes
-        MAX_TRACKS = 4096
         if num_transform_tracks > MAX_TRACKS:
             print(f"WARNING: Clamping num_transform_tracks from {num_transform_tracks} to {MAX_TRACKS}")
             num_transform_tracks = MAX_TRACKS

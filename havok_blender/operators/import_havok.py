@@ -21,6 +21,15 @@ from ..io.parsers import (
     PAK_PLATFORM_ENDIANNESS,
 )
 
+_PAK_PROFILE_ITEMS = (
+    [
+        (name, name.replace("_", " "), f"Use the {name} PAK layout")
+        for name in PAK_PROFILE_NAMES
+    ]
+    if PAK_PROFILE_NAMES
+    else [("AUTO", "Auto", "PAK import profile list is unavailable in this build")]
+)
+
 
 class HavokPakEntry(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty()
@@ -173,11 +182,8 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
     pak_profile: bpy.props.EnumProperty(
         name="Game version",
         description="Choose the exact PAK layout for the game you are importing",
-        items=[
-            (name, name.replace("_", " "), f"Use the {name} PAK layout")
-            for name in PAK_PROFILE_NAMES
-        ],
-        default=PAK_PROFILE_NAMES[0] if PAK_PROFILE_NAMES else "",
+        items=_PAK_PROFILE_ITEMS,
+        default=_PAK_PROFILE_ITEMS[0][0],
         update=_refresh_pak_entries,
     )
     pak_platform: bpy.props.EnumProperty(
@@ -318,10 +324,22 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
 
-        prefs = context.preferences.addons[__package__.split(".")[0]].preferences
+        addon_key = __package__.split(".")[0]
+        addon_entry = context.preferences.addons.get(addon_key)
+        if addon_entry:
+            prefs = addon_entry.preferences
+        else:
+            class _FallbackPrefs:
+                scale = 1.0
+                forward_axis = "Y"
+                up_axis = "Z"
+
+            prefs = _FallbackPrefs()
         axis_mat: Matrix = axis_conversion(
-            from_forward="-Y",
-            from_up="Z",
+            # Havok skeletons in this pipeline are Y-up with Z-forward.
+            # Convert to user-selected Blender axes (default: Y-forward, Z-up).
+            from_forward="Z",
+            from_up="Y",
             to_forward=prefs.forward_axis,
             to_up=prefs.up_axis,
         ).to_4x4()
@@ -329,7 +347,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         armature_obj = (
             context.active_object
             if context.active_object and context.active_object.type == "ARMATURE"
-            else None
+            else self._get_selected_armature(context)
         )
 
         if armature_obj is None and self.import_skeleton and pack.skeleton:
@@ -340,14 +358,20 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
         selected_animations = self._resolve_animations(pack)
         if self._should_import_animation(target_ext, selected_animations, armature_obj):
-            self._build_animations(
-                context,
-                pack,
-                selected_animations,
-                armature_obj,
-                prefs.scale * self.animation_scale,
-                axis_mat,
-            )
+            if armature_obj is None:
+                self.report(
+                    {"WARNING"},
+                    "Animation data found but no armature was available to bind tracks",
+                )
+            else:
+                self._build_animations(
+                    context,
+                    pack,
+                    selected_animations,
+                    armature_obj,
+                    prefs.scale * self.animation_scale,
+                    axis_mat,
+                )
 
         self.report({"INFO"}, f"Imported {filepath.name}")
         return {"FINISHED"}
@@ -397,6 +421,21 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             layout.prop(self, "pak_platform")
             layout.prop(self, "archive_entry")
 
+    @staticmethod
+    def _compose_transform(translation: Vector, rotation: mathutils.Quaternion, scale_vec: Vector) -> Matrix:
+        return (
+            Matrix.Translation(translation)
+            @ rotation.to_matrix().to_4x4()
+            @ Matrix.Scale(scale_vec[0], 4, (1, 0, 0))
+            @ Matrix.Scale(scale_vec[1], 4, (0, 1, 0))
+            @ Matrix.Scale(scale_vec[2], 4, (0, 0, 1))
+        )
+
+    @staticmethod
+    def _is_helper_bone_name(name: str) -> bool:
+        lower = name.lower()
+        return lower.startswith("z_dummy_") or "target" in lower
+
     def _build_armature(
         self,
         context: bpy.types.Context,
@@ -408,6 +447,10 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         skel = pack.skeleton
         armature = bpy.data.armatures.new(skel.name)
         armature_obj = bpy.data.objects.new(skel.name, armature)
+        try:
+            armature.display_type = "STICK"
+        except Exception:
+            pass
 
         collection = _get_or_create_collection(context, "Havok Imports")
         collection.objects.link(armature_obj)
@@ -415,44 +458,117 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
         armature_obj.matrix_world = axis_mat @ armature_obj.matrix_world
 
-        # Calculate global transforms for all bones
-        # Havok stores bones in local (parent-relative) space, so we must accumulate them
-        global_transforms = []
+        global_transforms: List[Matrix] = []
+        children: Dict[int, List[int]] = {idx: [] for idx in range(len(skel.bones))}
+
         for idx, bone in enumerate(skel.bones):
-            local_t = Matrix.Translation(bone.translation)
-            local_r = bone.rotation.to_matrix().to_4x4()
-            local_s = (
-                Matrix.Scale(bone.scale[0], 4, (1, 0, 0))
-                @ Matrix.Scale(bone.scale[1], 4, (0, 1, 0))
-                @ Matrix.Scale(bone.scale[2], 4, (0, 0, 1))
-            )
-            local_mat = local_t @ local_r @ local_s
+            local_mat = self._compose_transform(bone.translation, bone.rotation, bone.scale)
 
             if bone.parent >= 0 and bone.parent < len(global_transforms):
-                parent_mat = global_transforms[bone.parent]
-                global_mat = parent_mat @ local_mat
+                global_mat = global_transforms[bone.parent] @ local_mat
+                children[bone.parent].append(idx)
             else:
                 global_mat = local_mat
 
             global_transforms.append(global_mat)
 
         bpy.ops.object.mode_set(mode="EDIT")
-        for idx, bone in enumerate(skel.bones):
-            edit_bone = armature.edit_bones.new(bone.name)
-            global_mat = global_transforms[idx]
+        edit_bones: List[bpy.types.EditBone] = []
+        for bone in skel.bones:
+            edit_bones.append(armature.edit_bones.new(bone.name))
 
+        for idx, bone in enumerate(skel.bones):
+            if bone.parent >= 0 and bone.parent < len(skel.bones):
+                edit_bones[idx].parent = edit_bones[bone.parent]
+
+        min_len = max(0.02 * scale, 1e-4)
+        default_len = max(0.10 * scale, min_len)
+
+        for idx, bone in enumerate(skel.bones):
+            edit_bone = edit_bones[idx]
+            global_mat = global_transforms[idx]
             head = global_mat.to_translation() * scale
             rot = global_mat.to_quaternion()
 
-            edit_bone.head = head
-            # Align bone Y-axis with the rotation
-            edit_bone.tail = head + rot @ Vector((0.0, 0.1 * scale, 0.0))
+            child_dists = []
+            child_vectors = []
+            for child_idx in children.get(idx, []):
+                vec = (
+                    global_transforms[child_idx].to_translation()
+                    - global_mat.to_translation()
+                ) * scale
+                dist = vec.length
+                if dist > 1e-6:
+                    child_dists.append(dist)
+                    child_vectors.append(vec)
 
-            if bone.parent >= 0 and bone.parent < len(skel.bones):
-                parent_edit_bone = armature.edit_bones[skel.bones[bone.parent].name]
-                edit_bone.parent = parent_edit_bone
+            if child_dists:
+                useful = [d for d in child_dists if d >= (min_len * 1.5)]
+                bone_len = max(min(useful if useful else child_dists), min_len)
+            elif bone.parent >= 0:
+                parent_dist = (
+                    global_mat.to_translation()
+                    - global_transforms[bone.parent].to_translation()
+                ).length * scale
+                bone_len = max(parent_dist * 0.5, min_len)
+            else:
+                bone_len = default_len
+
+            child_dir = None
+            if child_vectors:
+                useful_vecs = [v for v in child_vectors if v.length >= (min_len * 1.5)]
+                candidate_vecs = useful_vecs if useful_vecs else child_vectors
+                chosen_vec = min(candidate_vecs, key=lambda v: abs(v.length - bone_len))
+                if chosen_vec.length > 1e-8:
+                    child_dir = chosen_vec.normalized()
+
+            if child_dir is None and bone.parent >= 0:
+                parent_head = global_transforms[bone.parent].to_translation() * scale
+                vec = head - parent_head
+                if vec.length > 1e-8:
+                    child_dir = vec.normalized()
+
+            if child_dir is None:
+                child_dir = (rot @ Vector((0.0, 1.0, 0.0))).normalized()
+
+            edit_bone.head = head
+            edit_bone.tail = head + child_dir * bone_len
+
+            # Preserve roll from Havok orientation, not only head/tail direction.
+            up_axis = rot @ Vector((0.0, 0.0, 1.0))
+            if up_axis.length_squared > 1e-8:
+                try:
+                    edit_bone.align_roll(up_axis)
+                except Exception:
+                    pass
 
         bpy.ops.object.mode_set(mode="OBJECT")
+
+        # Cache Havok metadata on Blender bones so animation-only HKX files
+        # (without embedded skeleton) can still map tracks correctly.
+        for idx, bone in enumerate(skel.bones):
+            dst_bone = armature_obj.data.bones.get(bone.name)
+            if not dst_bone:
+                continue
+            if self._is_helper_bone_name(bone.name):
+                dst_bone.use_deform = False
+            dst_bone["havok_index"] = idx
+            dst_bone["havok_rest_t"] = [
+                float(bone.translation[0]),
+                float(bone.translation[1]),
+                float(bone.translation[2]),
+            ]
+            dst_bone["havok_rest_r"] = [
+                float(bone.rotation.w),
+                float(bone.rotation.x),
+                float(bone.rotation.y),
+                float(bone.rotation.z),
+            ]
+            dst_bone["havok_rest_s"] = [
+                float(bone.scale[0]),
+                float(bone.scale[1]),
+                float(bone.scale[2]),
+            ]
 
         return armature_obj
 
@@ -513,75 +629,135 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         if armature_obj is None:
             return
 
-        # 1. Reconstruct Havok Global Rest Poses
-        # We need this to calculate the mapping between Havok bone space and Blender bone space
-        havok_global_rest = []
+        identity = Matrix.Identity(4)
+        armature_data = armature_obj.data
+        armature_bones = armature_data.bones
+        armature_by_name: Dict[str, bpy.types.Bone] = {b.name: b for b in armature_bones}
+
+        # Build Havok skeleton map (index -> {name,parent,rest_local}).
+        havok_nodes: Dict[int, Dict[str, object]] = {}
+        name_to_havok_index: Dict[str, int] = {}
+
         if pack.skeleton:
             for idx, bone in enumerate(pack.skeleton.bones):
-                # HavokBone stores the reference pose in local space
-                local_t = Matrix.Translation(bone.translation)
-                local_r = bone.rotation.to_matrix().to_4x4()
-                local_s = (
-                    Matrix.Scale(bone.scale[0], 4, (1, 0, 0))
-                    @ Matrix.Scale(bone.scale[1], 4, (0, 1, 0))
-                    @ Matrix.Scale(bone.scale[2], 4, (0, 0, 1))
-                )
+                havok_nodes[idx] = {
+                    "name": bone.name,
+                    "parent": bone.parent,
+                    "rest_local": self._compose_transform(
+                        bone.translation, bone.rotation, bone.scale
+                    ),
+                }
+                name_to_havok_index[bone.name] = idx
+        else:
+            for b in armature_bones:
+                idx_val = b.get("havok_index")
+                t = b.get("havok_rest_t")
+                r = b.get("havok_rest_r")
+                s = b.get("havok_rest_s")
+                if (
+                    isinstance(idx_val, (int, float))
+                    and isinstance(t, (list, tuple))
+                    and isinstance(r, (list, tuple))
+                    and isinstance(s, (list, tuple))
+                    and len(t) == 3
+                    and len(r) == 4
+                    and len(s) == 3
+                ):
+                    idx = int(idx_val)
+                    parent_idx = -1
+                    if b.parent:
+                        p_idx_val = b.parent.get("havok_index")
+                        if isinstance(p_idx_val, (int, float)):
+                            parent_idx = int(p_idx_val)
+                    havok_nodes[idx] = {
+                        "name": b.name,
+                        "parent": parent_idx,
+                        "rest_local": self._compose_transform(
+                            Vector((float(t[0]), float(t[1]), float(t[2]))),
+                            mathutils.Quaternion(
+                                (float(r[0]), float(r[1]), float(r[2]), float(r[3]))
+                            ),
+                            Vector((float(s[0]), float(s[1]), float(s[2]))),
+                        ),
+                    }
+                    name_to_havok_index[b.name] = idx
 
-                local_mat = local_t @ local_r @ local_s
-
-                if bone.parent >= 0 and bone.parent < len(havok_global_rest):
-                    parent_mat = havok_global_rest[bone.parent]
-                    global_mat = parent_mat @ local_mat
+        # Last-resort fallback if this armature was not created by this importer.
+        if not havok_nodes:
+            for idx, b in enumerate(armature_bones):
+                parent_idx = idx - 1
+                if b.parent and b.parent.name in name_to_havok_index:
+                    parent_idx = name_to_havok_index[b.parent.name]
+                elif not b.parent:
+                    parent_idx = -1
+                if b.parent:
+                    rest_local = b.parent.matrix_local.inverted() @ b.matrix_local
                 else:
-                    global_mat = local_mat
+                    rest_local = b.matrix_local
+                havok_nodes[idx] = {
+                    "name": b.name,
+                    "parent": parent_idx,
+                    "rest_local": rest_local.copy(),
+                }
+                name_to_havok_index[b.name] = idx
 
-                havok_global_rest.append(global_mat)
+        # Ensure parent indices are valid.
+        valid_indices = set(havok_nodes.keys())
+        for idx, node in havok_nodes.items():
+            p = int(node["parent"]) if isinstance(node["parent"], int) else -1
+            if p not in valid_indices:
+                node["parent"] = -1
 
-        # 2. Calculate R_fix for each bone
-        # R_fix = M_havok_rest.inverted() @ M_blender_rest
-        # M_blender_rest is bone.matrix_local
-        bone_r_fix = {}
-        blender_rest_globals = {}
-
-        bpy.ops.object.mode_set(
-            mode="EDIT"
-        )  # Ensure we are reading edit bones for rest pose?
-        # No, object mode is fine for reading data.bones
-        bpy.ops.object.mode_set(mode="OBJECT")
-
-        for bone in armature_obj.data.bones:
-            # Find corresponding Havok bone index
-            h_idx = -1
-            if pack.skeleton:
-                for i, b in enumerate(pack.skeleton.bones):
-                    if b.name == bone.name:
-                        h_idx = i
-                        break
-
-            if h_idx != -1 and h_idx < len(havok_global_rest):
-                m_havok = havok_global_rest[h_idx]
-                m_blender = bone.matrix_local  # Armature space
-
-                # R_fix maps Havok vector to Blender vector in Global space
-                # v_blender = v_havok @ R_fix ? No.
-                # M_blender = M_havok @ R_fix
-                # R_fix = M_havok.inverted() @ M_blender
-                r_fix = m_havok.inverted() @ m_blender
-                bone_r_fix[bone.name] = r_fix
-                blender_rest_globals[bone.name] = m_blender
+        # Rest transforms in Blender armature space.
+        blender_rest_globals: Dict[str, Matrix] = {}
+        blender_rest_locals: Dict[str, Matrix] = {}
+        for b in armature_bones:
+            blender_rest_globals[b.name] = b.matrix_local.copy()
+            if b.parent:
+                blender_rest_locals[b.name] = b.parent.matrix_local.inverted() @ b.matrix_local
             else:
-                bone_r_fix[bone.name] = Matrix.Identity(4)
-                blender_rest_globals[bone.name] = bone.matrix_local
+                blender_rest_locals[b.name] = b.matrix_local.copy()
 
-        # Pre-calculate rest local matrices for all bones (Blender space)
-        rest_locals = {}
-        for bone in armature_obj.data.bones:
-            if bone.parent:
-                rest_locals[bone.name] = (
-                    bone.parent.matrix_local.inverted() @ bone.matrix_local
-                )
+        # Recursive global builder to avoid assumptions about index ordering.
+        def build_globals(local_mats: Dict[int, Matrix]) -> Dict[int, Matrix]:
+            cache: Dict[int, Matrix] = {}
+
+            def resolve(idx: int) -> Matrix:
+                if idx in cache:
+                    return cache[idx]
+                node = havok_nodes[idx]
+                local = local_mats.get(idx, identity)
+                parent_idx = int(node["parent"]) if isinstance(node["parent"], int) else -1
+                if parent_idx in havok_nodes:
+                    mat = resolve(parent_idx) @ local
+                else:
+                    mat = local
+                cache[idx] = mat
+                return mat
+
+            for nidx in havok_nodes.keys():
+                resolve(nidx)
+            return cache
+
+        # Havok rest global transforms.
+        havok_rest_locals_by_index: Dict[int, Matrix] = {
+            idx: havok_nodes[idx]["rest_local"].copy() for idx in havok_nodes.keys()
+        }
+        havok_rest_globals = build_globals(havok_rest_locals_by_index)
+
+        # Global rest mapping from Havok -> Blender.
+        global_fixes: Dict[int, Matrix] = {}
+        for idx, node in havok_nodes.items():
+            name = str(node["name"])
+            h_rest_global = havok_rest_globals.get(idx, identity)
+            b_rest_global = blender_rest_globals.get(name)
+            if b_rest_global is not None:
+                try:
+                    global_fixes[idx] = h_rest_global.inverted() @ b_rest_global
+                except Exception:
+                    global_fixes[idx] = identity
             else:
-                rest_locals[bone.name] = bone.matrix_local
+                global_fixes[idx] = identity
 
         for animation in animations:
             action = bpy.data.actions.new(animation.name)
@@ -604,36 +780,56 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 if hasattr(armature_obj.animation_data, "action_slot_handle"):
                     armature_obj.animation_data.action_slot_handle = slot.handle
 
-            is_additive = animation.blend_hint in ("ADDITIVE", "ADDITIVE_DEPRECATED")
-
+            # Resolve track -> Havok bone index map once.
+            track_to_havok: Dict[int, int] = {}
             for track_idx, track in enumerate(animation.tracks):
                 if not track:
                     continue
 
                 bone_name = None
+                bone_idx = -1
 
                 # Try to find bone by annotation track name first
                 if track_idx < len(animation.annotation_tracks):
                     annot_name = animation.annotation_tracks[track_idx]
-                    if annot_name and armature_obj.pose.bones.get(annot_name):
+                    if annot_name and annot_name in name_to_havok_index:
                         bone_name = annot_name
+                        bone_idx = name_to_havok_index[annot_name]
 
                 # Fallback to binding indices
-                if not bone_name:
-                    bone_idx = (
+                if bone_idx < 0:
+                    candidate_idx = (
                         animation.track_to_bone[track_idx]
                         if track_idx < len(animation.track_to_bone)
                         else track_idx
                     )
-                    if pack.skeleton and 0 <= bone_idx < len(pack.skeleton.bones):
-                        bone_name = pack.skeleton.bones[bone_idx].name
+                    if candidate_idx in havok_nodes:
+                        bone_idx = candidate_idx
+                        bone_name = str(havok_nodes[candidate_idx]["name"])
 
-                if not bone_name:
+                if bone_idx < 0 or not bone_name:
                     continue
+                if self._is_helper_bone_name(bone_name):
+                    continue
+                track_to_havok[track_idx] = bone_idx
 
+            if not track_to_havok:
+                continue
+
+            animated_indices = sorted(set(track_to_havok.values()))
+            animated_names = [
+                str(havok_nodes[idx]["name"])
+                for idx in animated_indices
+                if str(havok_nodes[idx]["name"]) in armature_by_name
+            ]
+
+            # Pre-create fcurves once per animated bone.
+            bone_curves: Dict[str, tuple[list, list, list]] = {}
+            for bone_name in animated_names:
                 pose_bone = armature_obj.pose.bones.get(bone_name)
                 if not pose_bone:
                     continue
+                pose_bone.rotation_mode = "QUATERNION"
 
                 data_path_loc = pose_bone.path_from_id("location")
                 data_path_rot = pose_bone.path_from_id("rotation_quaternion")
@@ -648,76 +844,30 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 fcurves_scale = [
                     fcurves_collection.new(data_path_scale, index=i) for i in range(3)
                 ]
+                bone_curves[bone_name] = (fcurves_loc, fcurves_rot, fcurves_scale)
 
-                frame_count = len(track)
-                frame_rate = (
-                    (animation.duration / max(frame_count - 1, 1))
-                    if animation.duration > 0
-                    else 1.0
-                )
+            frame_count = max((len(t) for t in animation.tracks if t), default=0)
+            if frame_count <= 0:
+                continue
+            frame_rate = (
+                (animation.duration / max(frame_count - 1, 1))
+                if animation.duration > 0
+                else 1.0
+            )
 
-                rest_local = rest_locals.get(bone_name, Matrix.Identity(4))
-                r_fix = bone_r_fix.get(bone_name, Matrix.Identity(4))
+            for frame_idx in range(frame_count):
+                # Start from rest for bones without keyed tracks.
+                havok_anim_locals: Dict[int, Matrix] = {
+                    idx: mat.copy() for idx, mat in havok_rest_locals_by_index.items()
+                }
 
-                # Parent info for global calculation
-                parent_bone = pose_bone.parent
-                parent_name = parent_bone.name if parent_bone else None
+                for track_idx, bone_idx in track_to_havok.items():
+                    track = animation.tracks[track_idx]
+                    if not track:
+                        continue
+                    sample = track[min(frame_idx, len(track) - 1)]
+                    trans, quat, scale_vec = sample
 
-                # We need to cache calculated global matrices for the current frame
-                # But tracks are processed independently. This is a problem for global calculation.
-                # However, we can assume that we only need the PARENT's global matrix.
-                # But we don't have the parent's animated global matrix yet!
-                # This approach requires processing frames time-slice by time-slice, not track by track.
-
-                # Alternative:
-                # If we assume the animation is purely local (which it is),
-                # and we want to apply it to the Blender bone.
-                # M_blender_local = M_blender_parent_global.inverted() @ M_blender_global
-                # M_blender_global = M_havok_global @ R_fix
-                # M_havok_global = M_havok_parent_global @ M_havok_local
-
-                # This dependency chain is hard to resolve track-by-track.
-
-                # SIMPLIFICATION:
-                # Assume R_fix is only a rotation (it usually is).
-                # And assume parent's R_fix is similar? No.
-
-                # Let's go back to the delta idea.
-                # D_havok = M_havok_rest_local.inverted() @ M_havok_anim_local
-                # This is the local deformation in Havok space.
-                # We want to apply this deformation to the Blender bone.
-                # But the Blender bone has a different coordinate system.
-                # If we map D_havok to Blender space:
-                # D_blender = R_fix_local.inverted() @ D_havok @ R_fix_local ?
-                # Where R_fix_local is the rotation from Havok Bone Local Space to Blender Bone Local Space.
-
-                # Is R_fix (Global) the same as R_fix_local?
-                # M_blender = M_havok @ R_fix.
-                # M_blender_local = M_blender_parent.inverted() @ M_blender
-                # = (M_havok_parent @ R_fix_parent).inverted() @ (M_havok @ R_fix)
-                # = R_fix_parent.inverted() @ M_havok_parent.inverted() @ M_havok @ R_fix
-                # = R_fix_parent.inverted() @ M_havok_local @ R_fix
-
-                # So M_blender_local depends on Parent's R_fix and Own R_fix.
-
-                # We can pre-calculate R_fix for all bones.
-                # And we can pre-calculate R_fix_parent for all bones.
-
-                r_fix_parent = Matrix.Identity(4)
-                if parent_name:
-                    r_fix_parent = bone_r_fix.get(parent_name, Matrix.Identity(4))
-
-                # Now we can calculate M_blender_local for each frame WITHOUT full global simulation.
-                # M_blender_local = R_fix_parent.inverted() @ M_havok_local @ R_fix
-
-                # This is it! This formula converts a Havok Local Transform to a Blender Local Transform
-                # preserving the global pose, accounting for axis changes in both parent and child.
-
-                r_fix_inv = r_fix.inverted()  # Wait, formula says R_fix at end.
-                r_fix_parent_inv = r_fix_parent.inverted()
-
-                for frame_idx, (trans, quat, scale_vec) in enumerate(track):
-                    # Apply user overrides
                     t_x, t_y, t_z = trans
                     q_w, q_x, q_y, q_z = quat.w, quat.x, quat.y, quat.z
 
@@ -741,34 +891,60 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                     if self.anim_flip_quat_w:
                         q_w = -q_w
 
-                    trans = Vector((t_x, t_y, t_z))
-                    quat = mathutils.Quaternion((q_w, q_x, q_y, q_z))
-
-                    # Construct M_havok_local
-                    m_havok_local = (
-                        Matrix.Translation(trans)
-                        @ quat.to_matrix().to_4x4()
-                        @ Matrix.Scale(scale_vec[0], 4, (1, 0, 0))
-                        @ Matrix.Scale(scale_vec[1], 4, (0, 1, 0))
-                        @ Matrix.Scale(scale_vec[2], 4, (0, 0, 1))
+                    havok_anim_locals[bone_idx] = self._compose_transform(
+                        Vector((t_x, t_y, t_z)) * scale,
+                        mathutils.Quaternion((q_w, q_x, q_y, q_z)),
+                        Vector(scale_vec),
                     )
 
-                    # Calculate M_blender_local
-                    # M_blender_local = R_fix_parent.inverted() @ M_havok_local @ R_fix
-                    m_blender_local = r_fix_parent_inv @ m_havok_local @ r_fix
+                havok_anim_globals = build_globals(havok_anim_locals)
 
-                    # Calculate M_basis (relative to rest pose)
-                    # M_basis = rest_local.inverted() @ m_blender_local
-                    matrix_basis = rest_local.inverted() @ m_blender_local
+                # Convert to target Blender armature-space globals.
+                blender_target_globals: Dict[str, Matrix] = {}
+                for idx, node in havok_nodes.items():
+                    name = str(node["name"])
+                    blender_target_globals[name] = (
+                        havok_anim_globals.get(idx, identity) @ global_fixes.get(idx, identity)
+                    )
+
+                frame = (
+                    frame_idx
+                    * frame_rate
+                    * context.scene.render.fps
+                    / context.scene.render.fps_base
+                )
+
+                for bone_name in animated_names:
+                    if bone_name not in bone_curves:
+                        continue
+                    bone_data = armature_by_name.get(bone_name)
+                    target_global = blender_target_globals.get(bone_name)
+                    if bone_data is None or target_global is None:
+                        continue
+
+                    if bone_data.parent:
+                        parent_name = bone_data.parent.name
+                        parent_target = blender_target_globals.get(parent_name)
+                        rest_local = blender_rest_locals.get(bone_name, identity)
+                        if parent_target is not None:
+                            matrix_basis = (
+                                rest_local.inverted()
+                                @ parent_target.inverted()
+                                @ target_global
+                            )
+                        else:
+                            matrix_basis = (
+                                blender_rest_globals.get(bone_name, identity).inverted()
+                                @ target_global
+                            )
+                    else:
+                        matrix_basis = (
+                            blender_rest_globals.get(bone_name, identity).inverted()
+                            @ target_global
+                        )
 
                     loc, rot, sca = matrix_basis.decompose()
-
-                    frame = (
-                        frame_idx
-                        * frame_rate
-                        * context.scene.render.fps
-                        / context.scene.render.fps_base
-                    )
+                    fcurves_loc, fcurves_rot, fcurves_scale = bone_curves[bone_name]
 
                     for axis, curve in enumerate(fcurves_loc):
                         curve.keyframe_points.insert(
@@ -792,6 +968,9 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         for obj in context.selected_objects:
             if obj.type == "ARMATURE":
                 return obj
+        scene_armatures = [obj for obj in context.scene.objects if obj.type == "ARMATURE"]
+        if len(scene_armatures) == 1:
+            return scene_armatures[0]
         return None
 
     def _should_import_animation(

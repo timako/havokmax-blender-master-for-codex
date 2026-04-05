@@ -1,0 +1,45 @@
+# Build outputs
+*.bat
+*.aps
+*.7z
+.vscode/
+build/
+[Bb]in/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Blender local scenes and backups
+*.blend
+*.blend1
+*.blend2
+
+# Local test assets and logs
+*.hkx
+*.zip
+log-error.txt
+dump_header.py
+output/
+
+# Local reference code copies
+HavokMax-master/
+3rd_party/
+src/
+
+# Root-level upstream metadata copies kept locally
+/.gitattributes
+/.github/
+/.gitmodules
+/CHANGELOG
+/CMakeLists.txt
+/LICENSE
+/README.md
+/manifest.toml
+
+# Extra plugin files kept local-only in this workspace
+/havok_blender/io/__init__.py
+/havok_blender/io/igz_port/
+/havok_blender/operators/__init__.py
+/havok_blender/operators/preferences.py
+

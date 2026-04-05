@@ -200,7 +200,7 @@ def _parse_binary_packfile(data, override_name=None):
                             pose["rotation"][1],  # y
                             pose["rotation"][2],  # z
                         ))
-                        bones[idx].rotation = q.conjugated()
+                        bones[idx].rotation = q
                         bones[idx].scale = mathutils.Vector(pose["scale"])
 
                 skeleton = HavokSkeleton(name=skel_data["name"], bones=bones)
@@ -253,7 +253,7 @@ def _parse_binary_packfile(data, override_name=None):
                         vec = mathutils.Vector(trans)
                         quat = mathutils.Quaternion((rot[3], rot[0], rot[1], rot[2]))
                         sca = mathutils.Vector(scale)
-                        track_frames.append((vec, quat.conjugated(), sca))
+                        track_frames.append((vec, quat, sca))
                     converted_tracks.append(track_frames)
 
                 animations.append(HavokAnimation(
@@ -327,7 +327,7 @@ def _parse_skeleton(root, override_name=None):
             parent = int(_read_text(b, "parent", fallback="-1"))
             transform = b.find("hkparam[@name='transform']")
             translation = _read_vector(transform, "translation")
-            rotation = _read_quaternion(transform, "rotation").conjugated()
+            rotation = _read_quaternion(transform, "rotation")
             scale = _read_vector(transform, "scale")
             if scale.length_squared < 0.0001:
                 scale = mathutils.Vector((1.0, 1.0, 1.0))
