@@ -24,13 +24,14 @@ output/
 
 # Local reference code copies
 HavokMax-master/
-3rd_party/
+3rd_party/*
+!3rd_party/HavokLib
+!3rd_party/HavokLib/**
 src/
 
 # Root-level upstream metadata copies kept locally
 /.gitattributes
 /.github/
-/.gitmodules
 /CHANGELOG
 /CMakeLists.txt
 /LICENSE
