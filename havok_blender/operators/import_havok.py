@@ -343,8 +343,6 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             to_forward=prefs.forward_axis,
             to_up=prefs.up_axis,
         ).to_4x4()
-        # Keep original axis mapping, but cancel the unintended mirror across YZ.
-        axis_mat = axis_mat @ Matrix.Scale(-1.0, 4, (1.0, 0.0, 0.0))
 
         armature_obj = (
             context.active_object
@@ -431,13 +429,15 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
 
     @staticmethod
     def _compose_transform(translation: Vector, rotation: mathutils.Quaternion, scale_vec: Vector) -> Matrix:
-        return (
+        matrix = (
             Matrix.Translation(translation)
             @ rotation.to_matrix().to_4x4()
             @ Matrix.Scale(scale_vec[0], 4, (1, 0, 0))
             @ Matrix.Scale(scale_vec[1], 4, (0, 1, 0))
             @ Matrix.Scale(scale_vec[2], 4, (0, 0, 1))
         )
+        handedness_flip = Matrix.Scale(-1.0, 4, (1.0, 0.0, 0.0))
+        return handedness_flip @ matrix @ handedness_flip
 
     @staticmethod
     def _is_helper_bone_name(name: str) -> bool:
@@ -474,7 +474,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 global_mat = global_transforms[bone.parent] @ local_mat
                 children[bone.parent].append(idx)
             else:
-                global_mat = local_mat
+                global_mat = axis_mat @ local_mat
 
             global_transforms.append(global_mat)
 
@@ -654,6 +654,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         # Build Havok skeleton map (index -> {name,parent,rest_local}).
         havok_nodes: Dict[int, Dict[str, object]] = {}
         name_to_havok_index: Dict[str, int] = {}
+        roots_use_axis_mat = True
 
         if pack.skeleton:
             for idx, bone in enumerate(pack.skeleton.bones):
@@ -717,6 +718,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         # For animation-only files without annotation names, index-only mapping is
         # ambiguous, so require importer tags (havok_index) instead.
         if not havok_nodes:
+            roots_use_axis_mat = False
             if not pack.skeleton and not has_annotation_names:
                 self.report(
                     {"WARNING"},
@@ -770,7 +772,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 if parent_idx in havok_nodes:
                     mat = resolve(parent_idx) @ local
                 else:
-                    mat = local
+                    mat = axis_mat @ local if roots_use_axis_mat else local
                 cache[idx] = mat
                 return mat
 
