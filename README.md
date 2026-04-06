@@ -5,18 +5,13 @@ adds Blender-native import entries for Havok `.hkx`, `.hkt`, `.hka`, `.igz`,
 and `.pak` containers, plus configuration options that mirror the original
 tool's presets.
 
-> **Status:** The importer now reads Havok XML packfiles directly and mirrors the
-> igArchiveExtractor logic to unwrap PAK/IGZ archives. It builds real armatures
-> and keyframed actions when animation data is present, and will also construct
-> static meshes from Havok geometry blocks even when no skeleton exists. IGZ
-> files are parsed with the io_scene_igz-style fixup walker so NHMT memory
-> blocks are resolved before scanning for Havok XML or compressed payloads.
+> **Status:** The importer now reads Havok 2010.2 pakfiles directly, including Skeleton and animation files. 
+> Tested on Blender 5.1 already but not on Blender 4.x
 
 ## Installation
 
-1. Download or clone this repository.
-2. From Blender **Edit → Preferences → Add-ons → Install…**, select the project
-   directory (the folder containing `manifest.toml`).
+1. Download or clone this repository, then zip the repo
+2. From Blender **Edit → Preferences → Add-ons → Install from Disk**, select the zipped project
 3. Enable **Havok IO** in the add-on list.
 
 ## Usage
