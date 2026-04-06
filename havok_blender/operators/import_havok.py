@@ -464,8 +464,6 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         collection.objects.link(armature_obj)
         bpy.context.view_layer.objects.active = armature_obj
 
-        armature_obj.matrix_world = axis_mat @ armature_obj.matrix_world
-
         global_transforms: List[Matrix] = []
         children: Dict[int, List[int]] = {idx: [] for idx in range(len(skel.bones))}
 
@@ -492,19 +490,29 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         min_len = max(0.02 * scale, 1e-4)
         default_len = max(0.10 * scale, min_len)
 
+        axis_basis = axis_mat.to_3x3()
+        transformed_heads: List[Vector] = []
+        transformed_up_axes: List[Vector] = []
+        transformed_forward_axes: List[Vector] = []
+
+        for global_mat in global_transforms:
+            transformed_heads.append(
+                axis_basis @ (global_mat.to_translation() * scale)
+            )
+            rot = global_mat.to_quaternion()
+            transformed_up_axes.append(axis_basis @ (rot @ Vector((0.0, 0.0, 1.0))))
+            transformed_forward_axes.append(
+                axis_basis @ (rot @ Vector((0.0, 1.0, 0.0)))
+            )
+
         for idx, bone in enumerate(skel.bones):
             edit_bone = edit_bones[idx]
-            global_mat = global_transforms[idx]
-            head = global_mat.to_translation() * scale
-            rot = global_mat.to_quaternion()
+            head = transformed_heads[idx]
 
             child_dists = []
             child_vectors = []
             for child_idx in children.get(idx, []):
-                vec = (
-                    global_transforms[child_idx].to_translation()
-                    - global_mat.to_translation()
-                ) * scale
+                vec = transformed_heads[child_idx] - head
                 dist = vec.length
                 if dist > 1e-6:
                     child_dists.append(dist)
@@ -514,10 +522,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 useful = [d for d in child_dists if d >= (min_len * 1.5)]
                 bone_len = max(min(useful if useful else child_dists), min_len)
             elif bone.parent >= 0:
-                parent_dist = (
-                    global_mat.to_translation()
-                    - global_transforms[bone.parent].to_translation()
-                ).length * scale
+                parent_dist = (head - transformed_heads[bone.parent]).length
                 bone_len = max(parent_dist * 0.5, min_len)
             else:
                 bone_len = default_len
@@ -531,19 +536,23 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                     child_dir = chosen_vec.normalized()
 
             if child_dir is None and bone.parent >= 0:
-                parent_head = global_transforms[bone.parent].to_translation() * scale
+                parent_head = transformed_heads[bone.parent]
                 vec = head - parent_head
                 if vec.length > 1e-8:
                     child_dir = vec.normalized()
 
             if child_dir is None:
-                child_dir = (rot @ Vector((0.0, 1.0, 0.0))).normalized()
+                fallback_dir = transformed_forward_axes[idx]
+                if fallback_dir.length > 1e-8:
+                    child_dir = fallback_dir.normalized()
+                else:
+                    child_dir = Vector((0.0, 1.0, 0.0))
 
             edit_bone.head = head
             edit_bone.tail = head + child_dir * bone_len
 
             # Preserve roll from Havok orientation, not only head/tail direction.
-            up_axis = rot @ Vector((0.0, 0.0, 1.0))
+            up_axis = transformed_up_axes[idx]
             if up_axis.length_squared > 1e-8:
                 try:
                     edit_bone.align_roll(up_axis)
