@@ -3,7 +3,7 @@ from __future__ import annotations
 """Havok importer for HKX/HKT/HKA/IGZ/PAK packfiles."""
 
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 import bpy
 import mathutils
@@ -268,6 +268,61 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         min=0.0001,
     )
 
+    animation_import_mode: bpy.props.EnumProperty(
+        name="Animation Import Mode",
+        description="Choose how imported animation data is stored in Blender",
+        items=[
+            (
+                "ACTION_PUSH_NLA",
+                "Action + Push to NLA",
+                "Create a sparse editable Action, push it to NLA, and clear the active Action",
+            ),
+            (
+                "ACTION_ONLY",
+                "Action Only",
+                "Create a sparse editable Action and keep it as the active Action",
+            ),
+            (
+                "BAKED_DENSE_ACTION",
+                "Baked Dense Action",
+                "Bake location, rotation, and scale for every animated bone on every decoded sample",
+            ),
+        ],
+        default="ACTION_PUSH_NLA",
+    )
+
+    animation_scale_mode: bpy.props.EnumProperty(
+        name="Scale Tracks",
+        description="Choose when scale curves should be written in sparse animation modes",
+        items=[
+            (
+                "AUTO",
+                "Only Animated Scale",
+                "Only write scale curves when the sampled pose deviates from identity",
+            ),
+            (
+                "NONE",
+                "Skip Scale",
+                "Do not write scale curves in sparse animation modes",
+            ),
+            (
+                "ALWAYS",
+                "Always Write Scale",
+                "Always write scale curves in sparse animation modes",
+            ),
+        ],
+        default="AUTO",
+    )
+
+    animation_translation_bones: bpy.props.StringProperty(
+        name="Translation Bones",
+        description=(
+            "Comma-separated bone names that should keep location keys in sparse "
+            "animation modes. Leave empty to use root/hips/master heuristics."
+        ),
+        default="",
+    )
+
     anim_flip_x: bpy.props.BoolProperty(name="Flip X Translation")
     anim_flip_y: bpy.props.BoolProperty(name="Flip Y Translation")
     anim_flip_z: bpy.props.BoolProperty(name="Flip Z Translation")
@@ -392,6 +447,10 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
             layout.separator()
             layout.label(text="Animation options:")
             layout.prop(self, "animation_scale")
+            layout.prop(self, "animation_import_mode")
+            if self.animation_import_mode != "BAKED_DENSE_ACTION":
+                layout.prop(self, "animation_scale_mode")
+                layout.prop(self, "animation_translation_bones")
 
             row = layout.row()
             row.prop(self, "anim_swap_yz")
@@ -444,6 +503,201 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         lower = name.lower()
         return lower.startswith("z_dummy_") or "target" in lower
 
+    @staticmethod
+    def _parse_name_set(raw_value: str) -> Set[str]:
+        return {
+            token.strip().lower()
+            for token in raw_value.replace(";", ",").split(",")
+            if token.strip()
+        }
+
+    @staticmethod
+    def _looks_like_motion_bone(name: str) -> bool:
+        normalized = "".join(ch for ch in name.lower() if ch.isalnum())
+        return any(
+            token in normalized for token in ("root", "master", "hips", "pelvis", "cog")
+        )
+
+    def _resolve_translation_bones(
+        self,
+        animated_names: List[str],
+        armature_by_name: Dict[str, bpy.types.Bone],
+    ) -> Set[str]:
+        explicit_names = self._parse_name_set(self.animation_translation_bones)
+        if explicit_names:
+            return {
+                bone_name
+                for bone_name in animated_names
+                if bone_name.lower() in explicit_names
+            }
+
+        translation_bones: Set[str] = set()
+        for bone_name in animated_names:
+            bone = armature_by_name.get(bone_name)
+            if bone is not None and bone.parent is None:
+                translation_bones.add(bone_name)
+                continue
+            if self._looks_like_motion_bone(bone_name):
+                translation_bones.add(bone_name)
+        return translation_bones
+
+    @staticmethod
+    def _build_sample_frames(
+        context: bpy.types.Context, duration: float, frame_count: int
+    ) -> List[float]:
+        if frame_count <= 0:
+            return []
+        if frame_count == 1 or duration <= 0:
+            return [0.0] * frame_count
+
+        fps = context.scene.render.fps / max(context.scene.render.fps_base, 1e-8)
+        seconds_per_sample = duration / max(frame_count - 1, 1)
+        return [sample_idx * seconds_per_sample * fps for sample_idx in range(frame_count)]
+
+    @staticmethod
+    def _canonicalize_quaternion(
+        rotation: mathutils.Quaternion,
+        previous: Optional[mathutils.Quaternion],
+    ) -> mathutils.Quaternion:
+        quat = rotation.copy()
+        try:
+            quat.normalize()
+        except Exception:
+            pass
+        if previous is not None and quat.dot(previous) < 0.0:
+            quat = mathutils.Quaternion((-quat.w, -quat.x, -quat.y, -quat.z))
+        return quat
+
+    @staticmethod
+    def _values_match(a, b, tolerance: float = 1e-5) -> bool:
+        try:
+            return all(abs(float(a[idx]) - float(b[idx])) <= tolerance for idx in range(len(a)))
+        except Exception:
+            return False
+
+    @classmethod
+    def _select_sparse_key_indices(
+        cls,
+        values: List[object],
+        default_value,
+        *,
+        include_default: bool = False,
+        tolerance: float = 1e-5,
+    ) -> List[int]:
+        if not values:
+            return []
+
+        if not include_default and all(
+            cls._values_match(value, default_value, tolerance) for value in values
+        ):
+            return []
+
+        last_index = len(values) - 1
+        if last_index <= 0:
+            return [0]
+
+        selected = [0]
+        for idx in range(1, last_index):
+            if cls._values_match(values[idx], values[idx - 1], tolerance) and cls._values_match(
+                values[idx], values[idx + 1], tolerance
+            ):
+                continue
+            selected.append(idx)
+
+        if last_index not in selected:
+            selected.append(last_index)
+        return selected
+
+    @staticmethod
+    def _insert_channel_keys(
+        fcurves_collection,
+        data_path: str,
+        sample_frames: List[float],
+        values: List[object],
+        component_count: int,
+    ) -> int:
+        if not sample_frames or not values:
+            return 0
+
+        curves = [fcurves_collection.new(data_path, index=axis) for axis in range(component_count)]
+        inserted = 0
+        for sample_frame, value in zip(sample_frames, values):
+            for axis, curve in enumerate(curves):
+                curve.keyframe_points.insert(
+                    sample_frame, float(value[axis]), options={"FAST"}
+                ).interpolation = "LINEAR"
+                inserted += 1
+        return inserted
+
+    @staticmethod
+    def _ensure_action_fcurves(
+        action: bpy.types.Action, animation_data: bpy.types.AnimData
+    ):
+        if hasattr(action, "fcurves"):
+            return action.fcurves
+
+        slot = action.slots.new("OBJECT", "Slot")
+        layer = action.layers.new("Layer")
+        strip = layer.strips.new(type="KEYFRAME")
+        bag = strip.channelbags.new(slot)
+
+        if hasattr(animation_data, "action_slot_handle"):
+            animation_data.action_slot_handle = slot.handle
+
+        return bag.fcurves
+
+    def _create_action(
+        self, armature_obj: bpy.types.Object, action_name: str
+    ) -> tuple[bpy.types.Action, object]:
+        animation_data = armature_obj.animation_data_create()
+        action = bpy.data.actions.new(action_name)
+        action.use_fake_user = True
+        animation_data.action = action
+        return action, self._ensure_action_fcurves(action, animation_data)
+
+    @staticmethod
+    def _push_action_to_nla(
+        armature_obj: bpy.types.Object,
+        action: bpy.types.Action,
+        blend_hint: str,
+    ) -> None:
+        animation_data = armature_obj.animation_data_create()
+        track = animation_data.nla_tracks.new()
+        track.name = action.name
+
+        action_start = float(action.frame_range[0]) if action.frame_range else 0.0
+        action_end = float(action.frame_range[1]) if action.frame_range else action_start + 1.0
+        strip_start = int(round(action_start))
+        strip = track.strips.new(action.name, strip_start, action)
+        strip.name = action.name
+        strip.action_frame_start = action_start
+        strip.action_frame_end = action_end
+        strip.frame_start = strip_start
+        strip.frame_end = max(strip_start + (action_end - action_start), strip_start + 1.0)
+
+        if strip.frame_end <= strip.frame_start:
+            strip.frame_end = strip.frame_start + 1.0
+
+        if blend_hint == "ADDITIVE":
+            try:
+                strip.blend_type = "ADD"
+            except Exception:
+                pass
+
+    def _finalize_action_import(
+        self,
+        armature_obj: bpy.types.Object,
+        action: bpy.types.Action,
+        import_mode: str,
+        animation: parsers.HavokAnimation,
+    ) -> None:
+        animation_data = armature_obj.animation_data_create()
+        if import_mode == "ACTION_PUSH_NLA":
+            self._push_action_to_nla(armature_obj, action, animation.blend_hint)
+            animation_data.action = None
+            return
+        animation_data.action = action
+
     def _build_armature(
         self,
         context: bpy.types.Context,
@@ -490,29 +744,19 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
         min_len = max(0.02 * scale, 1e-4)
         default_len = max(0.10 * scale, min_len)
 
-        axis_basis = axis_mat.to_3x3()
-        transformed_heads: List[Vector] = []
-        transformed_up_axes: List[Vector] = []
-        transformed_forward_axes: List[Vector] = []
-
-        for global_mat in global_transforms:
-            transformed_heads.append(
-                axis_basis @ (global_mat.to_translation() * scale)
-            )
-            rot = global_mat.to_quaternion()
-            transformed_up_axes.append(axis_basis @ (rot @ Vector((0.0, 0.0, 1.0))))
-            transformed_forward_axes.append(
-                axis_basis @ (rot @ Vector((0.0, 1.0, 0.0)))
-            )
-
         for idx, bone in enumerate(skel.bones):
             edit_bone = edit_bones[idx]
-            head = transformed_heads[idx]
+            global_mat = global_transforms[idx]
+            head = global_mat.to_translation() * scale
+            rot = global_mat.to_quaternion()
 
             child_dists = []
             child_vectors = []
             for child_idx in children.get(idx, []):
-                vec = transformed_heads[child_idx] - head
+                vec = (
+                    global_transforms[child_idx].to_translation()
+                    - global_mat.to_translation()
+                ) * scale
                 dist = vec.length
                 if dist > 1e-6:
                     child_dists.append(dist)
@@ -522,7 +766,10 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 useful = [d for d in child_dists if d >= (min_len * 1.5)]
                 bone_len = max(min(useful if useful else child_dists), min_len)
             elif bone.parent >= 0:
-                parent_dist = (head - transformed_heads[bone.parent]).length
+                parent_dist = (
+                    global_mat.to_translation()
+                    - global_transforms[bone.parent].to_translation()
+                ).length * scale
                 bone_len = max(parent_dist * 0.5, min_len)
             else:
                 bone_len = default_len
@@ -536,23 +783,19 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                     child_dir = chosen_vec.normalized()
 
             if child_dir is None and bone.parent >= 0:
-                parent_head = transformed_heads[bone.parent]
+                parent_head = global_transforms[bone.parent].to_translation() * scale
                 vec = head - parent_head
                 if vec.length > 1e-8:
                     child_dir = vec.normalized()
 
             if child_dir is None:
-                fallback_dir = transformed_forward_axes[idx]
-                if fallback_dir.length > 1e-8:
-                    child_dir = fallback_dir.normalized()
-                else:
-                    child_dir = Vector((0.0, 1.0, 0.0))
+                child_dir = (rot @ Vector((0.0, 1.0, 0.0))).normalized()
 
             edit_bone.head = head
             edit_bone.tail = head + child_dir * bone_len
 
             # Preserve roll from Havok orientation, not only head/tail direction.
-            up_axis = transformed_up_axes[idx]
+            up_axis = rot @ Vector((0.0, 0.0, 1.0))
             if up_axis.length_squared > 1e-8:
                 try:
                     edit_bone.align_roll(up_axis)
@@ -858,61 +1101,15 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                 skipped_unmatched += 1
                 continue
 
-            action = bpy.data.actions.new(animation.name)
-            armature_obj.animation_data_create()
-            armature_obj.animation_data.action = action
-
-            # Blender 5.0+ compatibility: Action.fcurves replaced by Layered Action API
-            fcurves_collection = None
-            if hasattr(action, "fcurves"):
-                fcurves_collection = action.fcurves
-            else:
-                # Create necessary hierarchy for Layered Action
-                slot = action.slots.new("OBJECT", "Slot")
-                layer = action.layers.new("Layer")
-                strip = layer.strips.new(type="KEYFRAME")
-                bag = strip.channelbags.new(slot)
-                fcurves_collection = bag.fcurves
-
-                # Assign the slot to the object's animation data
-                if hasattr(armature_obj.animation_data, "action_slot_handle"):
-                    armature_obj.animation_data.action_slot_handle = slot.handle
-
-            # Pre-create fcurves once per animated bone.
-            bone_curves: Dict[str, tuple[list, list, list]] = {}
-            for bone_name in animated_names:
-                pose_bone = armature_obj.pose.bones.get(bone_name)
-                if not pose_bone:
-                    continue
-                pose_bone.rotation_mode = "QUATERNION"
-
-                data_path_loc = pose_bone.path_from_id("location")
-                data_path_rot = pose_bone.path_from_id("rotation_quaternion")
-                data_path_scale = pose_bone.path_from_id("scale")
-
-                fcurves_loc = [
-                    fcurves_collection.new(data_path_loc, index=i) for i in range(3)
-                ]
-                fcurves_rot = [
-                    fcurves_collection.new(data_path_rot, index=i) for i in range(4)
-                ]
-                fcurves_scale = [
-                    fcurves_collection.new(data_path_scale, index=i) for i in range(3)
-                ]
-                bone_curves[bone_name] = (fcurves_loc, fcurves_rot, fcurves_scale)
-
-            if not bone_curves:
-                bpy.data.actions.remove(action)
-                skipped_unmatched += 1
-                continue
-
-            frame_rate = (
-                (animation.duration / max(frame_count - 1, 1))
-                if animation.duration > 0
-                else 1.0
-            )
-
-            inserted_keyframes = 0
+            sample_frames = self._build_sample_frames(context, animation.duration, frame_count)
+            bone_samples: Dict[str, Dict[str, list]] = {
+                bone_name: {
+                    "location": [],
+                    "rotation_quaternion": [],
+                    "scale": [],
+                }
+                for bone_name in animated_names
+            }
 
             for frame_idx in range(frame_count):
                 # Start from rest for bones without keyed tracks.
@@ -966,16 +1163,7 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                         havok_anim_globals.get(idx, identity) @ global_fixes.get(idx, identity)
                     )
 
-                frame = (
-                    frame_idx
-                    * frame_rate
-                    * context.scene.render.fps
-                    / context.scene.render.fps_base
-                )
-
                 for bone_name in animated_names:
-                    if bone_name not in bone_curves:
-                        continue
                     bone_data = armature_by_name.get(bone_name)
                     target_global = blender_target_globals.get(bone_name)
                     if bone_data is None or target_global is None:
@@ -1003,31 +1191,115 @@ class HAVOK_OT_import(bpy.types.Operator, ImportHelper):
                         )
 
                     loc, rot, sca = matrix_basis.decompose()
-                    fcurves_loc, fcurves_rot, fcurves_scale = bone_curves[bone_name]
+                    bone_sample = bone_samples[bone_name]
+                    previous_rot = (
+                        bone_sample["rotation_quaternion"][-1]
+                        if bone_sample["rotation_quaternion"]
+                        else None
+                    )
+                    rot = self._canonicalize_quaternion(rot, previous_rot)
+                    bone_sample["location"].append(loc.copy())
+                    bone_sample["rotation_quaternion"].append(rot.copy())
+                    bone_sample["scale"].append(sca.copy())
 
-                    for axis, curve in enumerate(fcurves_loc):
-                        curve.keyframe_points.insert(
-                            frame, loc[axis], options={"FAST"}
-                        ).interpolation = "LINEAR"
-                        inserted_keyframes += 1
-                    for axis, curve in enumerate(fcurves_rot):
-                        curve.keyframe_points.insert(
-                            frame, rot[axis], options={"FAST"}
-                        ).interpolation = "LINEAR"
-                        inserted_keyframes += 1
-                    for axis, curve in enumerate(fcurves_scale):
-                        curve.keyframe_points.insert(
-                            frame, sca[axis], options={"FAST"}
-                        ).interpolation = "LINEAR"
-                        inserted_keyframes += 1
+            action_name = animation.name or f"Animation_{imported_actions}"
+            action, fcurves_collection = self._create_action(armature_obj, action_name)
+
+            inserted_keyframes = 0
+            import_mode = self.animation_import_mode
+            dense_mode = import_mode == "BAKED_DENSE_ACTION"
+            translation_bones = self._resolve_translation_bones(
+                animated_names, armature_by_name
+            )
+            loc_default = Vector((0.0, 0.0, 0.0))
+            rot_default = mathutils.Quaternion((1.0, 0.0, 0.0, 0.0))
+            scale_default = Vector((1.0, 1.0, 1.0))
+
+            for bone_name in animated_names:
+                pose_bone = armature_obj.pose.bones.get(bone_name)
+                if not pose_bone:
+                    continue
+
+                pose_bone.rotation_mode = "QUATERNION"
+                bone_sample = bone_samples.get(bone_name)
+                if not bone_sample:
+                    continue
+
+                data_path_loc = pose_bone.path_from_id("location")
+                data_path_rot = pose_bone.path_from_id("rotation_quaternion")
+                data_path_scale = pose_bone.path_from_id("scale")
+
+                if dense_mode:
+                    inserted_keyframes += self._insert_channel_keys(
+                        fcurves_collection,
+                        data_path_loc,
+                        sample_frames,
+                        bone_sample["location"],
+                        3,
+                    )
+                    inserted_keyframes += self._insert_channel_keys(
+                        fcurves_collection,
+                        data_path_rot,
+                        sample_frames,
+                        bone_sample["rotation_quaternion"],
+                        4,
+                    )
+                    inserted_keyframes += self._insert_channel_keys(
+                        fcurves_collection,
+                        data_path_scale,
+                        sample_frames,
+                        bone_sample["scale"],
+                        3,
+                    )
+                    continue
+
+                if bone_name in translation_bones:
+                    loc_indices = self._select_sparse_key_indices(
+                        bone_sample["location"], loc_default
+                    )
+                    if loc_indices:
+                        inserted_keyframes += self._insert_channel_keys(
+                            fcurves_collection,
+                            data_path_loc,
+                            [sample_frames[idx] for idx in loc_indices],
+                            [bone_sample["location"][idx] for idx in loc_indices],
+                            3,
+                        )
+
+                rot_indices = self._select_sparse_key_indices(
+                    bone_sample["rotation_quaternion"], rot_default
+                )
+                if rot_indices:
+                    inserted_keyframes += self._insert_channel_keys(
+                        fcurves_collection,
+                        data_path_rot,
+                        [sample_frames[idx] for idx in rot_indices],
+                        [bone_sample["rotation_quaternion"][idx] for idx in rot_indices],
+                        4,
+                    )
+
+                if self.animation_scale_mode != "NONE":
+                    scale_indices = self._select_sparse_key_indices(
+                        bone_sample["scale"],
+                        scale_default,
+                        include_default=self.animation_scale_mode == "ALWAYS",
+                    )
+                    if scale_indices:
+                        inserted_keyframes += self._insert_channel_keys(
+                            fcurves_collection,
+                            data_path_scale,
+                            [sample_frames[idx] for idx in scale_indices],
+                            [bone_sample["scale"][idx] for idx in scale_indices],
+                            3,
+                        )
 
             if inserted_keyframes <= 0:
+                armature_obj.animation_data.action = None
                 bpy.data.actions.remove(action)
                 skipped_unmatched += 1
                 continue
 
-            # Keep last non-empty action applied
-            armature_obj.animation_data.action = action
+            self._finalize_action_import(armature_obj, action, import_mode, animation)
             imported_actions += 1
 
         if imported_actions == 0 and animations:
